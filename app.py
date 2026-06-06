@@ -1786,12 +1786,12 @@ def run_app() -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(plot_cost_waterfall(sc_routes), use_container_width=True)
+            st.plotly_chart(plot_cost_waterfall(sc_routes), use_container_width=True, key="overview_cost_waterfall")
         with c2:
             if not sc_mc.empty:
                 fig = px.histogram(sc_mc, x="pickup_on_time_rate", nbins=20, title="Monte Carlo pickup on-time distribution", color_discrete_sequence=["#1E9E60"])
                 fig.update_layout(height=430, xaxis_tickformat=".0%", margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="overview_on_time_histogram")
 
         c3, c4 = st.columns(2)
         with c3:
@@ -1803,7 +1803,7 @@ def run_app() -> None:
                     color_discrete_map={"OK": "#1E9E60", "Check": "#D71920"},
                 )
                 util_fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(util_fig, use_container_width=True)
+                st.plotly_chart(util_fig, use_container_width=True, key="overview_route_utilization")
         with c4:
             if not sc_cost_components.empty:
                 stack_fig = px.bar(
@@ -1812,7 +1812,7 @@ def run_app() -> None:
                     color_discrete_sequence=["#D71920", "#F2B705", "#1F77B4", "#7B61FF", "#00A6A6"],
                 )
                 stack_fig.update_layout(height=420, yaxis_title="VND", margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(stack_fig, use_container_width=True)
+                st.plotly_chart(stack_fig, use_container_width=True, key="overview_cost_stack")
 
     with tab_routes:
         st.subheader("Optimized route plan + spatial visualization")
@@ -1822,7 +1822,11 @@ def run_app() -> None:
             horizontal=True,
         )
         st.caption("Route lines are schematic road-like polylines when no official route geometry is uploaded; cost/time still comes from the distance/time matrix or fallback matrix.")
-        st.plotly_chart(plot_route_map(sc_routes, sc_route_legs, sc_stops, suppliers_geo, sc_route_risk, map_scope), use_container_width=True)
+        st.plotly_chart(
+            plot_route_map(sc_routes, sc_route_legs, sc_stops, suppliers_geo, sc_route_risk, map_scope),
+            use_container_width=True,
+            key=f"routes_map_{re.sub(r'[^a-zA-Z0-9_]+', '_', map_scope)}",
+        )
         plan = sc_routes.copy()
         if not plan.empty:
             plan["utilization"] = plan["utilization"].map(lambda x: f"{x:.1%}")
@@ -1847,7 +1851,7 @@ def run_app() -> None:
     with tab_timeline:
         st.subheader("Event-based simulation timeline")
         st.caption("Màu đỏ = delay, vàng = waiting, xanh dương = driving, tím = loading, xanh ngọc = dock.")
-        st.plotly_chart(plot_timeline(sc_events, selected_date), use_container_width=True)
+        st.plotly_chart(plot_timeline(sc_events, selected_date), use_container_width=True, key="timeline_events_chart")
         st.markdown("### Stop schedule")
         if not sc_stops.empty:
             stop_show = sc_stops.copy()
@@ -1883,7 +1887,7 @@ def run_app() -> None:
             )
             c1, c2 = st.columns(2)
             with c1:
-                st.plotly_chart(plot_cost_waterfall(sc_routes), use_container_width=True)
+                st.plotly_chart(plot_cost_waterfall(sc_routes), use_container_width=True, key="cost_tab_waterfall")
             with c2:
                 component_total = sc_cost_components.groupby("component", as_index=False)["cost_vnd"].sum()
                 pie = px.pie(
@@ -1892,7 +1896,7 @@ def run_app() -> None:
                     color_discrete_sequence=["#D71920", "#F2B705", "#1F77B4", "#7B61FF", "#00A6A6"],
                 )
                 pie.update_layout(height=430, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(pie, use_container_width=True)
+                st.plotly_chart(pie, use_container_width=True, key="cost_tab_component_pie")
 
     with tab_whatif:
         st.subheader("Baseline vs Current Scenario")
@@ -1918,7 +1922,7 @@ def run_app() -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(plot_scenario_box(base_mc, sc_mc), use_container_width=True)
+            st.plotly_chart(plot_scenario_box(base_mc, sc_mc), use_container_width=True, key="whatif_scenario_box")
         with c2:
             delta_df = pd.DataFrame({
                 "KPI": ["Cost", "Utilization", "Pickup on-time", "Route late risk", "CO₂"],
@@ -1932,7 +1936,7 @@ def run_app() -> None:
             })
             fig = px.bar(delta_df, x="KPI", y="Delta", text=delta_df["Delta"].map(lambda x: f"{x:+.1%}"), color="Delta", color_continuous_scale=["#1E9E60", "#F2B705", "#D71920"])
             fig.update_layout(height=430, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10), coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="whatif_delta_bar")
 
     with tab_model:
         st.subheader("Simulation and optimization logic")
