@@ -66,6 +66,11 @@ DEFAULT_EMISSION_FACTORS = {
     "Xe tải 10 tấn": 1.05,
 }
 
+VIETNAM_ISLAND_MARKERS = [
+    {"name": "Hoàng Sa (Việt Nam)", "lat": 16.50, "lon": 112.00},
+    {"name": "Trường Sa (Việt Nam)", "lat": 10.00, "lon": 114.00},
+]
+
 
 # =============================
 # 1) Data classes
@@ -669,7 +674,9 @@ def simulate_route(
         end_drive = time_now + travel_min
         events.append({
             "route_id": route_id, "node": sid, "phase": "Driving", "start_min": start_drive,
-            "end_min": end_drive, "label": f"{prev} → {sid}", "minutes": travel_min
+            "end_min": end_drive, "label": f"{prev} → {sid}", "minutes": travel_min,
+            "from_node": prev, "to_node": sid, "distance_km": base_km,
+            "base_travel_min": base_travel, "travel_factor": travel_factor,
         })
         total_km += base_km
         driving_min += travel_min
@@ -725,10 +732,13 @@ def simulate_route(
     # Return to TMV
     base_km = get_matrix_value(dist, prev, "TMV", 0.0)
     base_travel = get_matrix_value(dur, prev, "TMV", 0.0)
-    travel_min = base_travel * draw_tri(travel_tri)
+    travel_factor = draw_tri(travel_tri)
+    travel_min = base_travel * travel_factor
     events.append({
         "route_id": route_id, "node": "TMV", "phase": "Driving", "start_min": time_now,
-        "end_min": time_now + travel_min, "label": f"{prev} → TMV", "minutes": travel_min
+        "end_min": time_now + travel_min, "label": f"{prev} → TMV", "minutes": travel_min,
+        "from_node": prev, "to_node": "TMV", "distance_km": base_km,
+        "base_travel_min": base_travel, "travel_factor": travel_factor,
     })
     total_km += base_km
     driving_min += travel_min
@@ -808,6 +818,17 @@ def simulate_route(
         "arrival_tmv_time": clock(arrival_tmv),
         "finish_tmv_time": clock(finish_tmv),
         "delivery_late_min": delivery_late,
+        "km_rate_vnd_per_km": km_rate,
+        "fuel_multiplier": params.fuel_multiplier,
+        "stop_fee_vnd_per_stop": stop_fee,
+        "wait_fee_vnd_per_hour": wait_fee,
+        "overtime_min": max(finish_tmv - params.tmv_end_min, 0.0),
+        "overtime_penalty_vnd_per_min": params.overtime_penalty_vnd_per_min,
+        "emission_kg_per_km": emission_factor,
+        "co2_price_vnd_per_kg": params.co2_price_vnd_per_kg,
+        "dock_wait_min": dock_wait,
+        "dock_transfer_min": dock_transfer,
+        "unload_min": total_packages * params.unload_min_per_package,
         "transport_cost_vnd": transport_cost,
         "stop_cost_vnd": stop_cost,
         "wait_cost_vnd": wait_cost,
@@ -1038,6 +1059,132 @@ def build_route_risk(routes_df: pd.DataFrame, route_reps: pd.DataFrame) -> pd.Da
     return out
 
 
+def build_route_leg_schedule(events_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df.empty:
+        return pd.DataFrame()
+    legs = events_df[events_df["phase"] == "Driving"].copy()
+    if legs.empty:
+        return pd.DataFrame()
+    if "from_node" not in legs.columns or "to_node" not in legs.columns:
+        parts = legs["label"].astype(str).str.split("→", expand=True)
+        legs["from_node"] = parts[0].str.strip()
+        legs["to_node"] = parts[1].str.strip() if parts.shape[1] > 1 else ""
+    for col in ["distance_km", "base_travel_min", "travel_factor", "minutes"]:
+        if col not in legs.columns:
+            legs[col] = np.nan
+        legs[col] = pd.to_numeric(legs[col], errors="coerce")
+    legs["leg_no"] = legs.groupby("route_id").cumcount() + 1
+    legs["depart_time"] = legs["start_min"].map(clock)
+    legs["arrive_time"] = legs["end_min"].map(clock)
+    legs["speed_kmh_effective"] = legs.apply(
+        lambda r: float(r["distance_km"]) / max(float(r["minutes"]) / 60, 1e-6)
+        if not pd.isna(r["distance_km"]) and not pd.isna(r["minutes"]) else np.nan,
+        axis=1,
+    )
+    return legs[[
+        "route_id", "leg_no", "from_node", "to_node", "depart_time", "arrive_time",
+        "distance_km", "base_travel_min", "travel_factor", "minutes",
+        "speed_kmh_effective", "label",
+    ]].reset_index(drop=True)
+
+
+def build_cost_calculation(routes_df: pd.DataFrame) -> pd.DataFrame:
+    if routes_df.empty:
+        return pd.DataFrame()
+    df = routes_df.copy()
+    defaults = {
+        "km_rate_vnd_per_km": 0.0,
+        "fuel_multiplier": 1.0,
+        "stop_fee_vnd_per_stop": 0.0,
+        "wait_fee_vnd_per_hour": 0.0,
+        "overtime_min": 0.0,
+        "overtime_penalty_vnd_per_min": 0.0,
+        "co2_price_vnd_per_kg": 0.0,
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    df["transport_formula"] = df.apply(
+        lambda r: f"{r['distance_km']:.1f} km x {r['km_rate_vnd_per_km']:,.0f} VND/km x {r['fuel_multiplier']:.2f}",
+        axis=1,
+    )
+    df["stop_formula"] = df.apply(
+        lambda r: f"{int(r['stops'])} stops x {r['stop_fee_vnd_per_stop']:,.0f} VND/stop",
+        axis=1,
+    )
+    df["wait_formula"] = df.apply(
+        lambda r: f"{r['waiting_min']:.1f} min / 60 x {r['wait_fee_vnd_per_hour']:,.0f} VND/hour",
+        axis=1,
+    )
+    df["overtime_formula"] = df.apply(
+        lambda r: f"{r['overtime_min']:.1f} min x {r['overtime_penalty_vnd_per_min']:,.0f} VND/min",
+        axis=1,
+    )
+    df["co2_formula"] = df.apply(
+        lambda r: f"{r['co2_kg']:.1f} kg x {r['co2_price_vnd_per_kg']:,.0f} VND/kg",
+        axis=1,
+    )
+    return df[[
+        "route_id", "sequence", "truck_type", "distance_km", "km_rate_vnd_per_km",
+        "fuel_multiplier", "transport_formula", "transport_cost_vnd",
+        "stops", "stop_fee_vnd_per_stop", "stop_formula", "stop_cost_vnd",
+        "waiting_min", "wait_fee_vnd_per_hour", "wait_formula", "wait_cost_vnd",
+        "overtime_min", "overtime_penalty_vnd_per_min", "overtime_formula", "overtime_cost_vnd",
+        "co2_kg", "co2_price_vnd_per_kg", "co2_formula", "co2_cost_vnd", "total_cost_vnd",
+    ]].reset_index(drop=True)
+
+
+def cost_components_long(routes_df: pd.DataFrame) -> pd.DataFrame:
+    if routes_df.empty:
+        return pd.DataFrame()
+    component_cols = {
+        "transport_cost_vnd": "Km transport",
+        "stop_cost_vnd": "Stop fee",
+        "wait_cost_vnd": "Waiting",
+        "overtime_cost_vnd": "Overtime",
+        "co2_cost_vnd": "CO2 internal",
+    }
+    rows = []
+    for _, r in routes_df.iterrows():
+        for col, label in component_cols.items():
+            rows.append({"route_id": r["route_id"], "component": label, "cost_vnd": float(r.get(col, 0.0))})
+    return pd.DataFrame(rows)
+
+
+def build_scenario_param_diff(baseline: ScenarioParams, current: ScenarioParams) -> pd.DataFrame:
+    rows = []
+    fields = [
+        ("Demand multiplier", "demand_multiplier", "Daily volume stress"),
+        ("Fuel / km cost multiplier", "fuel_multiplier", "Transport cost stress"),
+        ("Travel triangular", "travel_triangular", "Traffic uncertainty"),
+        ("Loading triangular", "loading_triangular", "Supplier loading uncertainty"),
+        ("Dock A wait triangular", "dock_a_wait_triangular", "TMV Dock A congestion"),
+        ("Dock W wait triangular", "dock_w_wait_triangular", "TMV Dock W congestion"),
+        ("Unavailable trucks", "unavailable_trucks", "Vehicle availability"),
+        ("CO2 price", "co2_price_vnd_per_kg", "Internal carbon pricing"),
+    ]
+    for label, attr, meaning in fields:
+        b = getattr(baseline, attr)
+        c = getattr(current, attr)
+        if isinstance(b, tuple):
+            b_show = ", ".join(map(str, b)) if b else "None"
+            c_show = ", ".join(map(str, c)) if c else "None"
+            delta = "Changed" if b != c else "No change"
+        else:
+            b_show = f"{float(b):,.2f}" if isinstance(b, (int, float, np.number)) else str(b)
+            c_show = f"{float(c):,.2f}" if isinstance(c, (int, float, np.number)) else str(c)
+            delta = f"{float(c) - float(b):+,.2f}" if isinstance(b, (int, float, np.number)) else ("Changed" if b != c else "No change")
+        rows.append({
+            "parameter": label,
+            "baseline": b_show,
+            "current": c_show,
+            "delta": delta,
+            "changed": b != c,
+            "simulation_role": meaning,
+        })
+    return pd.DataFrame(rows)
+
+
 # =============================
 # 9) Visualization
 # =============================
@@ -1048,7 +1195,7 @@ def inject_css() -> None:
         <style>
         .block-container {{ padding-top: 1.4rem; }}
         .kpi-card {{
-            border-radius: 18px;
+            border-radius: 8px;
             padding: 18px 18px;
             background: #FFFFFF;
             box-shadow: 0 6px 18px rgba(0,0,0,0.06);
@@ -1059,8 +1206,16 @@ def inject_css() -> None:
         .kpi-value {{ color: #111827; font-size: 1.55rem; font-weight: 800; line-height: 1.15; }}
         .kpi-note {{ color: #6B7280; font-size: 0.80rem; margin-top: 8px; }}
         .decision-box {{
-            border-radius: 16px; padding: 16px 18px; color: #111827;
+            border-radius: 8px; padding: 16px 18px; color: #111827;
             background: #fff; border: 1px solid #E5E7EB;
+        }}
+        .method-box {{
+            border-radius: 8px; padding: 14px 16px; color: #111827;
+            background: #F9FAFB; border: 1px solid #E5E7EB; min-height: 118px;
+        }}
+        .formula-chip {{
+            display: inline-block; padding: 4px 8px; border-radius: 6px;
+            background: #F3F4F6; color: #374151; font-family: monospace; font-size: 0.86rem;
         }}
         .small-muted {{ color:#6B7280; font-size:0.86rem; }}
         </style>
@@ -1097,45 +1252,154 @@ def decision_recommendation(summary: Dict[str, float]) -> Tuple[str, str]:
     return "good", "Phương án chấp nhận được: tiếp tục kiểm tra tuyến vàng trước khi vận hành."
 
 
-def plot_route_map(routes_df: pd.DataFrame, suppliers_geo: pd.DataFrame, route_risk: pd.DataFrame) -> go.Figure:
+def interpolate_path(points: List[Tuple[float, float]], steps_per_segment: int = 8) -> Tuple[List[float], List[float]]:
+    lats, lons = [], []
+    for a, b in zip(points[:-1], points[1:]):
+        lat1, lon1 = a
+        lat2, lon2 = b
+        for k in range(steps_per_segment):
+            t = k / max(steps_per_segment, 1)
+            lats.append(lat1 + (lat2 - lat1) * t)
+            lons.append(lon1 + (lon2 - lon1) * t)
+    lats.append(points[-1][0])
+    lons.append(points[-1][1])
+    return lats, lons
+
+
+def schematic_road_polyline(
+    from_coord: Tuple[float, float],
+    to_coord: Tuple[float, float],
+    key: str,
+) -> Tuple[List[float], List[float]]:
+    lat1, lon1 = from_coord
+    lat2, lon2 = to_coord
+    if abs(lat2 - lat1) < 1e-9 and abs(lon2 - lon1) < 1e-9:
+        return [lat1, lat2], [lon1, lon2]
+    bend = ((sum(ord(c) for c in key) % 7) - 3) * 0.01
+    if abs(lon2 - lon1) >= abs(lat2 - lat1):
+        mid_lon = lon1 + (lon2 - lon1) * 0.62
+        points = [(lat1, lon1), (lat1 + bend, mid_lon), (lat2 - bend, mid_lon), (lat2, lon2)]
+    else:
+        mid_lat = lat1 + (lat2 - lat1) * 0.62
+        points = [(lat1, lon1), (mid_lat, lon1 + bend), (mid_lat, lon2 - bend), (lat2, lon2)]
+    return interpolate_path(points)
+
+
+def plot_route_map(
+    routes_df: pd.DataFrame,
+    route_legs: pd.DataFrame,
+    stops_df: pd.DataFrame,
+    suppliers_geo: pd.DataFrame,
+    route_risk: pd.DataFrame,
+    map_scope: str = "Operational route",
+) -> go.Figure:
     fig = go.Figure()
     if routes_df.empty:
         return fig
     coords = suppliers_geo.set_index("supplier_id")[["lat", "lon"]].to_dict("index")
     risk_map = route_risk.set_index("route_id")["risk_status"].to_dict() if not route_risk.empty else {}
+    late_map = route_risk.set_index("route_id")["late_probability"].to_dict() if not route_risk.empty and "late_probability" in route_risk.columns else {}
+    route_meta = routes_df.set_index("route_id").to_dict("index")
+
+    if not route_legs.empty:
+        for _, leg in route_legs.iterrows():
+            rid = leg["route_id"]
+            meta = route_meta.get(rid, {})
+            status = risk_map.get(rid, "good")
+            color = STATUS_COLORS[status]
+            from_node = str(leg["from_node"]).strip()
+            to_node = str(leg["to_node"]).strip()
+            if from_node == "TMV":
+                from_coord = DEFAULT_TMV_COORD
+            elif from_node in coords:
+                from_coord = (float(coords[from_node]["lat"]), float(coords[from_node]["lon"]))
+            else:
+                continue
+            if to_node == "TMV":
+                to_coord = DEFAULT_TMV_COORD
+            elif to_node in coords:
+                to_coord = (float(coords[to_node]["lat"]), float(coords[to_node]["lon"]))
+            else:
+                continue
+            lats, lons = schematic_road_polyline(from_coord, to_coord, f"{rid}-{leg['leg_no']}-{from_node}-{to_node}")
+            hover = (
+                f"<b>{rid} | Leg {int(leg['leg_no'])}: {from_node} → {to_node}</b><br>"
+                f"Depart: {leg['depart_time']} | Arrive: {leg['arrive_time']}<br>"
+                f"Distance: {float(leg['distance_km']):,.1f} km | Travel: {float(leg['minutes']):,.1f} min<br>"
+                f"Truck: {meta.get('truck_type', '')} | Utilization: {float(meta.get('utilization', 0)):.1%}<br>"
+                f"Route cost: {fmt_vnd(meta.get('total_cost_vnd', 0))}<br>"
+                f"Late probability: {float(late_map.get(rid, 0)):.1%}<extra></extra>"
+            )
+            fig.add_trace(go.Scattermapbox(
+                lat=lats, lon=lons, mode="lines",
+                name=f"{rid} leg {int(leg['leg_no'])}",
+                line=dict(width=max(2, min(7, 2 + float(meta.get("volume_m3", 0)) / 8)), color=color),
+                hovertemplate=hover,
+                showlegend=False,
+            ))
+
     for _, r in routes_df.iterrows():
         status = risk_map.get(r["route_id"], "good")
         color = STATUS_COLORS[status]
-        seq_sup = [s.strip() for s in str(r["sequence"]).split("→")]
-        lats = [DEFAULT_TMV_COORD[0]]
-        lons = [DEFAULT_TMV_COORD[1]]
-        texts = ["TMV"]
-        for sid in seq_sup:
-            sid = sid.strip()
-            if sid in coords:
-                lats.append(coords[sid]["lat"])
-                lons.append(coords[sid]["lon"])
-                texts.append(sid)
-        lats.append(DEFAULT_TMV_COORD[0])
-        lons.append(DEFAULT_TMV_COORD[1])
-        texts.append("TMV")
         fig.add_trace(go.Scattermapbox(
-            lat=lats, lon=lons, mode="lines+markers+text", text=texts,
-            textposition="top center",
+            lat=[None], lon=[None], mode="lines",
             name=f"{r['route_id']} | {r['truck_type']}",
-            line=dict(width=max(2, min(7, 2 + r["volume_m3"] / 8)), color=color),
-            marker=dict(size=10, color=color),
-            hovertemplate="%{text}<extra></extra>",
+            line=dict(width=5, color=color),
         ))
+
+    if not stops_df.empty:
+        stop_geo = stops_df.merge(
+            suppliers_geo[["supplier_id", "lat", "lon", "address", "working_hours"]],
+            on="supplier_id", how="left",
+        ).dropna(subset=["lat", "lon"])
+        for _, s in stop_geo.iterrows():
+            status = risk_map.get(s["route_id"], "good")
+            color = STATUS_COLORS[status]
+            hover = (
+                f"<b>{s['route_id']} | {s['supplier_id']}</b><br>"
+                f"Address: {s.get('address', '')}<br>"
+                f"Working hours: {s.get('working_hours', '')}<br>"
+                f"Planned window: {s['planned_window']}<br>"
+                f"Arrival: {s['arrival_time']} | Depart: {s['depart_time']}<br>"
+                f"Volume: {float(s['volume_m3']):,.2f} m3 | Dock: {s['dock']}<br>"
+                f"Wait: {float(s['wait_min']):,.1f} min | Loading: {float(s['load_min']):,.1f} min | Late: {float(s['late_min']):,.1f} min"
+                "<extra></extra>"
+            )
+            fig.add_trace(go.Scattermapbox(
+                lat=[float(s["lat"])], lon=[float(s["lon"])], mode="markers+text",
+                text=[s["supplier_id"]], textposition="top center",
+                name=f"{s['supplier_id']} stop",
+                marker=dict(size=11, color=color),
+                hovertemplate=hover,
+                showlegend=False,
+            ))
+
     fig.add_trace(go.Scattermapbox(
         lat=[DEFAULT_TMV_COORD[0]], lon=[DEFAULT_TMV_COORD[1]], mode="markers+text",
         text=["TMV"], textposition="bottom right", name="TMV",
         marker=dict(size=18, color="#111827"),
+        hovertemplate="<b>TMV</b><br>Depot / receiving docks A and W<extra></extra>",
     ))
+
+    for marker in VIETNAM_ISLAND_MARKERS:
+        fig.add_trace(go.Scattermapbox(
+            lat=[marker["lat"]], lon=[marker["lon"]], mode="markers+text",
+            text=[marker["name"]], textposition="top center",
+            name=marker["name"],
+            marker=dict(size=12, color="#D71920", symbol="circle"),
+            hovertemplate=f"<b>{marker['name']}</b><br>Vietnam sovereignty marker<extra></extra>",
+        ))
+
+    if "Vietnam" in map_scope:
+        mapbox = dict(style="open-street-map", zoom=4.1, center=dict(lat=15.7, lon=109.7))
+        height = 700
+    else:
+        mapbox = dict(style="open-street-map", zoom=7.2, center=dict(lat=21.16, lon=105.95))
+        height = 640
     fig.update_layout(
-        mapbox=dict(style="open-street-map", zoom=7.2, center=dict(lat=21.16, lon=105.95)),
+        mapbox=mapbox,
         margin=dict(l=0, r=0, t=10, b=0),
-        height=620,
+        height=height,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig
@@ -1206,33 +1470,54 @@ def to_excel_download(
     routes_df: pd.DataFrame,
     stops_df: pd.DataFrame,
     events_df: pd.DataFrame,
+    route_legs: pd.DataFrame,
     route_risk: pd.DataFrame,
+    cost_detail: pd.DataFrame,
     scenario_summary: Dict[str, float],
+    baseline_summary: Dict[str, float],
     scenario_params: ScenarioParams,
+    baseline_params: ScenarioParams,
+    scenario_diff: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    try:
+        import xlsxwriter  # noqa: F401
+        excel_engine = "xlsxwriter"
+    except Exception:
+        excel_engine = "openpyxl"
+    with pd.ExcelWriter(output, engine=excel_engine) as writer:
         routes_export = routes_df.copy()
         if "nodes" in routes_export.columns:
             routes_export["nodes"] = routes_export["nodes"].astype(str)
         routes_export.to_excel(writer, sheet_name="route_summary", index=False)
+        route_legs.to_excel(writer, sheet_name="route_leg_schedule", index=False)
         stops_df.to_excel(writer, sheet_name="stop_schedule", index=False)
         events_df.to_excel(writer, sheet_name="timeline_events", index=False)
         route_risk.to_excel(writer, sheet_name="route_risk", index=False)
+        cost_detail.to_excel(writer, sheet_name="cost_calculation", index=False)
         pd.DataFrame([scenario_summary]).to_excel(writer, sheet_name="kpi_summary", index=False)
+        pd.DataFrame([baseline_summary]).to_excel(writer, sheet_name="baseline_kpi", index=False)
         pd.DataFrame([scenario_params.__dict__]).to_excel(writer, sheet_name="scenario_params", index=False)
-        workbook = writer.book
-        fmt_header = workbook.add_format({"bold": True, "bg_color": "#D71920", "font_color": "white"})
-        fmt_pct = workbook.add_format({"num_format": "0.0%"})
-        fmt_money = workbook.add_format({"num_format": "#,##0"})
-        for ws_name in writer.sheets:
-            ws = writer.sheets[ws_name]
-            ws.freeze_panes(1, 0)
-            ws.set_row(0, None, fmt_header)
-            ws.set_column(0, 40, 16)
-        if "route_summary" in writer.sheets:
-            writer.sheets["route_summary"].set_column("I:I", 12, fmt_pct)
-            writer.sheets["route_summary"].set_column("X:AD", 15, fmt_money)
+        pd.DataFrame([baseline_params.__dict__]).to_excel(writer, sheet_name="baseline_params", index=False)
+        scenario_diff.to_excel(writer, sheet_name="scenario_diff", index=False)
+        if excel_engine == "xlsxwriter":
+            workbook = writer.book
+            fmt_header = workbook.add_format({"bold": True, "bg_color": "#D71920", "font_color": "white"})
+            fmt_pct = workbook.add_format({"num_format": "0.0%"})
+            fmt_money = workbook.add_format({"num_format": "#,##0"})
+            for ws_name in writer.sheets:
+                ws = writer.sheets[ws_name]
+                ws.freeze_panes(1, 0)
+                ws.set_row(0, None, fmt_header)
+                ws.set_column(0, 40, 16)
+            if "route_summary" in writer.sheets:
+                writer.sheets["route_summary"].set_column("I:I", 12, fmt_pct)
+                writer.sheets["route_summary"].set_column("X:AD", 15, fmt_money)
+        else:
+            for ws in writer.sheets.values():
+                ws.freeze_panes = "A2"
+                for col in ws.columns:
+                    ws.column_dimensions[col[0].column_letter].width = 16
     return output.getvalue()
 
 
@@ -1321,32 +1606,34 @@ def run_app() -> None:
         selected_date = st.selectbox("Ngày mô phỏng", available_dates, index=0, format_func=lambda d: pd.Timestamp(d).strftime("%d/%m/%Y"))
         preset_name = st.selectbox("Preset scenario", list(presets.keys()), index=0)
         preset = presets[preset_name]
+        preset_key = re.sub(r"[^a-zA-Z0-9_]+", "_", preset_name)
 
         st.markdown("**Distribution-based simulation**")
         n_rep = st.slider("Số lần Monte Carlo", 50, 800, int(200), step=50)
         seed = st.number_input("Random seed", value=42, min_value=1, step=1)
-        demand_multiplier = st.slider("Demand multiplier", 0.70, 1.50, float(preset.get("demand_multiplier", 1.0)), step=0.05)
-        fuel_multiplier = st.slider("Fuel / km cost multiplier", 0.80, 1.50, float(preset.get("fuel_multiplier", 1.0)), step=0.05)
+        demand_multiplier = st.slider("Demand multiplier", 0.70, 1.50, float(preset.get("demand_multiplier", 1.0)), step=0.05, key=f"demand_multiplier_{preset_key}")
+        fuel_multiplier = st.slider("Fuel / km cost multiplier", 0.80, 1.50, float(preset.get("fuel_multiplier", 1.0)), step=0.05, key=f"fuel_multiplier_{preset_key}")
 
         st.markdown("**Travel time factor: triangular(min, mode, max)**")
         default_travel = preset.get("travel_triangular", [0.95, 1.05, 1.18])
-        t_min = st.slider("Travel min", 0.75, 1.50, float(default_travel[0]), step=0.01)
-        t_mode = st.slider("Travel mode", 0.80, 1.80, float(default_travel[1]), step=0.01)
-        t_max = st.slider("Travel max", 1.00, 2.50, float(default_travel[2]), step=0.01)
+        t_min = st.slider("Travel min", 0.75, 1.50, float(default_travel[0]), step=0.01, key=f"travel_min_{preset_key}")
+        t_mode = st.slider("Travel mode", 0.80, 1.80, float(default_travel[1]), step=0.01, key=f"travel_mode_{preset_key}")
+        t_max = st.slider("Travel max", 1.00, 2.50, float(default_travel[2]), step=0.01, key=f"travel_max_{preset_key}")
 
         st.markdown("**Loading time factor: triangular(min, mode, max)**")
         default_loading = preset.get("loading_triangular", [0.90, 1.05, 1.20])
-        l_min = st.slider("Loading min", 0.70, 1.50, float(default_loading[0]), step=0.01)
-        l_mode = st.slider("Loading mode", 0.80, 1.80, float(default_loading[1]), step=0.01)
-        l_max = st.slider("Loading max", 1.00, 2.50, float(default_loading[2]), step=0.01)
+        l_min = st.slider("Loading min", 0.70, 1.50, float(default_loading[0]), step=0.01, key=f"loading_min_{preset_key}")
+        l_mode = st.slider("Loading mode", 0.80, 1.80, float(default_loading[1]), step=0.01, key=f"loading_mode_{preset_key}")
+        l_max = st.slider("Loading max", 1.00, 2.50, float(default_loading[2]), step=0.01, key=f"loading_max_{preset_key}")
 
-        dock_a_wait_mode = st.slider("Dock A wait mode / phút", 0, 90, int(preset.get("dock_a_wait_mode", 8)), step=5)
-        dock_w_wait_mode = st.slider("Dock W wait mode / phút", 0, 90, int(preset.get("dock_w_wait_mode", 8)), step=5)
+        dock_a_wait_mode = st.slider("Dock A wait mode / phút", 0, 90, int(preset.get("dock_a_wait_mode", 8)), step=5, key=f"dock_a_wait_{preset_key}")
+        dock_w_wait_mode = st.slider("Dock W wait mode / phút", 0, 90, int(preset.get("dock_w_wait_mode", 8)), step=5, key=f"dock_w_wait_{preset_key}")
 
         unavailable_trucks = st.multiselect(
             "Xe không khả dụng",
             options=trucks["truck_type"].tolist(),
             default=preset.get("unavailable_trucks", []),
+            key=f"unavailable_trucks_{preset_key}",
         )
 
         with st.expander("Advanced assumptions"):
@@ -1381,20 +1668,19 @@ def run_app() -> None:
         "use_stacking_adjustment": use_stacking,
     }
     scenario_params = make_params_from_ui(preset, ui)
-    baseline_params = ScenarioParams(
-        n_replications=scenario_params.n_replications,
-        random_seed=scenario_params.random_seed,
-        road_factor=scenario_params.road_factor,
-        base_speed_kmh=scenario_params.base_speed_kmh,
-        start_min=scenario_params.start_min,
-        tmv_end_min=scenario_params.tmv_end_min,
-        dock_transfer_min=scenario_params.dock_transfer_min,
-        unload_min_per_package=scenario_params.unload_min_per_package,
-        overtime_penalty_vnd_per_min=scenario_params.overtime_penalty_vnd_per_min,
-        co2_price_vnd_per_kg=scenario_params.co2_price_vnd_per_kg,
-        unavailable_trucks=tuple(),
-        use_stacking_adjustment=scenario_params.use_stacking_adjustment,
-    )
+    normal_preset = presets.get("Normal baseline", {})
+    baseline_ui = ui.copy()
+    baseline_ui.update({
+        "demand_multiplier": normal_preset.get("demand_multiplier", 1.0),
+        "fuel_multiplier": normal_preset.get("fuel_multiplier", 1.0),
+        "travel_triangular": tuple(normal_preset.get("travel_triangular", [0.95, 1.05, 1.18])),
+        "loading_triangular": tuple(normal_preset.get("loading_triangular", [0.90, 1.05, 1.20])),
+        "dock_a_wait_mode": normal_preset.get("dock_a_wait_mode", 8),
+        "dock_w_wait_mode": normal_preset.get("dock_w_wait_mode", 8),
+        "unavailable_trucks": [],
+    })
+    baseline_params = make_params_from_ui(normal_preset, baseline_ui)
+    scenario_diff = build_scenario_param_diff(baseline_params, scenario_params)
 
     matrix_bytes = matrix_upload.getvalue() if matrix_upload else None
     uploaded_dist, uploaded_dur, matrix_ok = parse_uploaded_matrix(matrix_bytes)
@@ -1437,14 +1723,18 @@ def run_app() -> None:
         base_summary = summarize_plan(base_routes, base_mc)
         sc_summary = summarize_plan(sc_routes, sc_mc)
         sc_route_risk = build_route_risk(sc_routes, sc_route_reps)
+        sc_route_legs = build_route_leg_schedule(sc_events)
+        sc_cost_detail = build_cost_calculation(sc_routes)
+        sc_cost_components = cost_components_long(sc_routes)
 
     # =============================
     # Dashboard
     # =============================
     status, recommendation = decision_recommendation(sc_summary)
 
-    tab_overview, tab_routes, tab_timeline, tab_whatif, tab_data = st.tabs([
-        "1. Executive Dashboard", "2. Routes & Map", "3. Simulation Timeline", "4. What-if Comparison", "5. Data & Export"
+    tab_overview, tab_routes, tab_timeline, tab_cost, tab_whatif, tab_model, tab_data = st.tabs([
+        "1. Executive Dashboard", "2. Routes & Map", "3. Simulation Timeline",
+        "4. Cost Calculation", "5. What-if Comparison", "6. Model Logic", "7. Data & Export"
     ])
 
     with tab_overview:
@@ -1472,6 +1762,20 @@ def run_app() -> None:
             unsafe_allow_html=True,
         )
 
+        st.markdown("### Supportive diagnostics")
+        cost_delta = sc_summary.get("total_cost_vnd", 0) / max(base_summary.get("total_cost_vnd", 1), 1) - 1
+        on_time_delta = sc_summary.get("pickup_on_time_rate", 0) - base_summary.get("pickup_on_time_rate", 0)
+        risk_count = int((sc_route_risk.get("risk_status", pd.Series(dtype=str)) == "bad").sum()) if not sc_route_risk.empty else 0
+        worst_route = ""
+        if not sc_route_risk.empty and "late_probability" in sc_route_risk.columns:
+            worst = sc_route_risk.sort_values("late_probability", ascending=False).iloc[0]
+            worst_route = f"{worst['route_id']} ({float(worst['late_probability']):.1%})"
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Cost delta vs baseline", f"{cost_delta:+.1%}")
+        s2.metric("On-time delta", f"{on_time_delta:+.1%}")
+        s3.metric("High-risk routes", risk_count)
+        s4.metric("Worst route late prob.", worst_route or "N/A")
+
         st.markdown("### Route risk ranking")
         if not sc_route_risk.empty:
             show = sc_route_risk.copy()
@@ -1489,9 +1793,36 @@ def run_app() -> None:
                 fig.update_layout(height=430, xaxis_tickformat=".0%", margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
+        c3, c4 = st.columns(2)
+        with c3:
+            if not sc_routes.empty:
+                util_fig = px.bar(
+                    sc_routes, x="route_id", y="utilization", color="status",
+                    hover_data=["sequence", "truck_type", "volume_m3", "capacity_m3"],
+                    title="Route utilization by optimized route",
+                    color_discrete_map={"OK": "#1E9E60", "Check": "#D71920"},
+                )
+                util_fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(util_fig, use_container_width=True)
+        with c4:
+            if not sc_cost_components.empty:
+                stack_fig = px.bar(
+                    sc_cost_components, x="route_id", y="cost_vnd", color="component",
+                    title="Cost component stack by route",
+                    color_discrete_sequence=["#D71920", "#F2B705", "#1F77B4", "#7B61FF", "#00A6A6"],
+                )
+                stack_fig.update_layout(height=420, yaxis_title="VND", margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(stack_fig, use_container_width=True)
+
     with tab_routes:
         st.subheader("Optimized route plan + spatial visualization")
-        st.plotly_chart(plot_route_map(sc_routes, suppliers_geo, sc_route_risk), use_container_width=True)
+        map_scope = st.radio(
+            "Map scope",
+            ["Operational route", "Vietnam context incl. Hoàng Sa / Trường Sa"],
+            horizontal=True,
+        )
+        st.caption("Route lines are schematic road-like polylines when no official route geometry is uploaded; cost/time still comes from the distance/time matrix or fallback matrix.")
+        st.plotly_chart(plot_route_map(sc_routes, sc_route_legs, sc_stops, suppliers_geo, sc_route_risk, map_scope), use_container_width=True)
         plan = sc_routes.copy()
         if not plan.empty:
             plan["utilization"] = plan["utilization"].map(lambda x: f"{x:.1%}")
@@ -1499,6 +1830,19 @@ def run_app() -> None:
             for c in money_cols:
                 plan[c] = plan[c].map(fmt_vnd)
             st.dataframe(plan[["route_id", "sequence", "truck_type", "volume_m3", "capacity_m3", "utilization", "distance_km", "arrival_tmv_time", "finish_tmv_time", "status", "total_cost_vnd"]], use_container_width=True, hide_index=True)
+
+        st.markdown("### Leg-by-leg route schedule")
+        if not sc_route_legs.empty:
+            leg_show = sc_route_legs.copy()
+            for c in ["distance_km", "base_travel_min", "travel_factor", "minutes", "speed_kmh_effective"]:
+                leg_show[c] = leg_show[c].map(lambda x: "" if pd.isna(x) else round(float(x), 2))
+            st.dataframe(
+                leg_show[[
+                    "route_id", "leg_no", "from_node", "to_node", "depart_time", "arrive_time",
+                    "distance_km", "base_travel_min", "travel_factor", "minutes", "speed_kmh_effective",
+                ]],
+                use_container_width=True, hide_index=True,
+            )
 
     with tab_timeline:
         st.subheader("Event-based simulation timeline")
@@ -1511,6 +1855,44 @@ def run_app() -> None:
             stop_show["wait_min"] = stop_show["wait_min"].round(1)
             stop_show["load_min"] = stop_show["load_min"].round(1)
             st.dataframe(stop_show[["route_id", "supplier_id", "planned_window", "arrival_time", "depart_time", "wait_min", "load_min", "late_min", "volume_m3", "dock", "status"]], use_container_width=True, hide_index=True)
+
+    with tab_cost:
+        st.subheader("Cost calculation for current scenario")
+        st.markdown(
+            """
+            <span class="formula-chip">Total cost = km cost + stop fee + waiting fee + overtime penalty + internal CO2 cost</span>
+            """,
+            unsafe_allow_html=True,
+        )
+        if not sc_cost_detail.empty:
+            cost_show = sc_cost_detail.copy()
+            money_cols = [
+                "km_rate_vnd_per_km", "transport_cost_vnd", "stop_fee_vnd_per_stop", "stop_cost_vnd",
+                "wait_fee_vnd_per_hour", "wait_cost_vnd", "overtime_penalty_vnd_per_min",
+                "overtime_cost_vnd", "co2_price_vnd_per_kg", "co2_cost_vnd", "total_cost_vnd",
+            ]
+            for c in money_cols:
+                cost_show[c] = cost_show[c].map(fmt_vnd)
+            st.dataframe(
+                cost_show[[
+                    "route_id", "truck_type", "distance_km", "transport_formula", "transport_cost_vnd",
+                    "stop_formula", "stop_cost_vnd", "wait_formula", "wait_cost_vnd",
+                    "overtime_formula", "overtime_cost_vnd", "co2_formula", "co2_cost_vnd", "total_cost_vnd",
+                ]],
+                use_container_width=True, hide_index=True,
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.plotly_chart(plot_cost_waterfall(sc_routes), use_container_width=True)
+            with c2:
+                component_total = sc_cost_components.groupby("component", as_index=False)["cost_vnd"].sum()
+                pie = px.pie(
+                    component_total, names="component", values="cost_vnd",
+                    title="Cost share by component",
+                    color_discrete_sequence=["#D71920", "#F2B705", "#1F77B4", "#7B61FF", "#00A6A6"],
+                )
+                pie.update_layout(height=430, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(pie, use_container_width=True)
 
     with tab_whatif:
         st.subheader("Baseline vs Current Scenario")
@@ -1525,6 +1907,14 @@ def run_app() -> None:
             for c in ["utilization", "pickup_on_time_rate", "route_late_rate"]:
                 display[c] = display[c].map(lambda x: f"{x:.1%}")
             st.dataframe(display, use_container_width=True, hide_index=True)
+
+        st.markdown("### Scenario parameter audit")
+        if not scenario_diff.empty and not bool(scenario_diff["changed"].any()):
+            st.info("Current scenario uses the same stress parameters as Normal baseline. Choose another preset or adjust sliders to create a real what-if comparison.")
+        if not scenario_diff.empty:
+            diff_show = scenario_diff.copy()
+            diff_show["changed"] = diff_show["changed"].map(lambda x: "Yes" if x else "No")
+            st.dataframe(diff_show, use_container_width=True, hide_index=True)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1544,6 +1934,62 @@ def run_app() -> None:
             fig.update_layout(height=430, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10), coloraxis_showscale=False)
             st.plotly_chart(fig, use_container_width=True)
 
+    with tab_model:
+        st.subheader("Simulation and optimization logic")
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(
+                """
+                <div class="method-box">
+                <b>1. Baseline data layer</b><br>
+                Toyota case data is used as operational input: supplier windows, daily demand,
+                package dimensions, dock destination, truck capacity, rate card and stacking rule.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with m2:
+            st.markdown(
+                """
+                <div class="method-box">
+                <b>2. Optimization layer</b><br>
+                Routes are built by a Clarke-Wright savings heuristic, then checked through
+                capacity and supplier/TMV time-window simulation before a merge is accepted.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with m3:
+            st.markdown(
+                """
+                <div class="method-box">
+                <b>3. Simulation layer</b><br>
+                Uncertainty is applied only through controlled distributions: travel factor,
+                loading factor, dock wait, demand multiplier, fuel cost and truck availability.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("### Distribution formulas")
+        formula_df = pd.DataFrame([
+            {"component": "Travel time", "formula": "planned_duration_min x triangular(min, mode, max)", "source": "Matrix/GMaps duration as base; scenario controls uncertainty"},
+            {"component": "Loading time", "formula": "Toyota package loading_time x triangular(min, mode, max)", "source": "Toyota demand + loading lead time table"},
+            {"component": "Dock waiting", "formula": "triangular(0, dock_wait_mode, max)", "source": "Scenario assumption for Dock A / Dock W congestion"},
+            {"component": "Total cost", "formula": "km cost + stop fee + waiting fee + overtime + CO2 internal cost", "source": "Toyota rate card plus selected scenario multipliers"},
+        ])
+        st.dataframe(formula_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Optimization constraints used in the app")
+        constraint_df = pd.DataFrame([
+            {"constraint": "Truck capacity", "implementation": "Route volume must fit available truck capacity; oversize supplier nodes are split before routing."},
+            {"constraint": "Supplier working hours", "implementation": "Arrival before window causes waiting; arrival after window marks late and blocks route merge in deterministic optimization."},
+            {"constraint": "TMV receiving end time", "implementation": "Finish after receiving end hour creates overtime cost and infeasible-time status."},
+            {"constraint": "Dock A/W transfer", "implementation": "A route using both docks receives a dock transfer time penalty."},
+            {"constraint": "Matrix quality", "implementation": "Official distance/time matrix should be uploaded for scoring-grade results; fallback matrix is only a defendable demo assumption."},
+        ])
+        st.dataframe(constraint_df, use_container_width=True, hide_index=True)
+
     with tab_data:
         st.subheader("Data validation & export")
         c1, c2, c3, c4 = st.columns(4)
@@ -1560,8 +2006,17 @@ def run_app() -> None:
             st.dataframe(rates, use_container_width=True, hide_index=True)
         with st.expander("Scenario nodes"):
             st.dataframe(scenario_nodes, use_container_width=True, hide_index=True)
+        with st.expander("Route leg schedule"):
+            st.dataframe(sc_route_legs, use_container_width=True, hide_index=True)
+        with st.expander("Cost calculation detail"):
+            st.dataframe(sc_cost_detail, use_container_width=True, hide_index=True)
+        with st.expander("Scenario parameter diff"):
+            st.dataframe(scenario_diff, use_container_width=True, hide_index=True)
 
-        xlsx = to_excel_download(sc_routes, sc_stops, sc_events, sc_route_risk, sc_summary, scenario_params)
+        xlsx = to_excel_download(
+            sc_routes, sc_stops, sc_events, sc_route_legs, sc_route_risk, sc_cost_detail,
+            sc_summary, base_summary, scenario_params, baseline_params, scenario_diff,
+        )
         st.download_button(
             "⬇️ Download result Excel",
             data=xlsx,

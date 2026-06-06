@@ -11,8 +11,8 @@ Toyota official case data
 → Clean & aggregate daily demand
 → Build optimized Milk Run plan
 → Run distribution-based Monte Carlo simulation
-→ Show decision dashboard
-→ Export route plan / stop schedule / risk result
+→ Show decision dashboard + route/cost/model logic
+→ Export route plan / leg schedule / stop schedule / cost / risk result
 ```
 
 Điểm quan trọng: dữ liệu Toyota được dùng làm **baseline input thật**. Dữ liệu giả lập chỉ nằm ở lớp simulation, ví dụ traffic delay, loading delay, dock congestion, fuel cost change, vehicle unavailability.
@@ -58,13 +58,17 @@ Sau đó trình duyệt sẽ tự mở app.
    - Executive Dashboard
    - Routes & Map
    - Simulation Timeline
+   - Cost Calculation
    - What-if Comparison
+   - Model Logic
    - Data & Export
 7. Bấm **Download result Excel** để tải kết quả.
 
 ## 6. Distance/time matrix
 
 Tool có thể chạy dù chưa có distance/time matrix, nhưng khi đó app sẽ dùng fallback proxy từ địa chỉ để demo logic mô phỏng. Kết quả này nên ghi rõ trong báo cáo là **assumption**.
+
+Map trong app dùng distance/time matrix để tính chi phí và thời gian. Nếu chưa có dữ liệu route geometry chính thức, đường trên bản đồ là schematic road-like polyline để đọc tuyến dễ hơn, không phải turn-by-turn Google Maps polyline. App có thêm lớp bối cảnh Việt Nam với Hoàng Sa và Trường Sa.
 
 Nếu có matrix chính thức, nên upload file Excel dạng long format:
 
@@ -95,6 +99,9 @@ Kết quả chính:
 - average delay
 - CO2 estimate
 - route risk ranking
+- route leg schedule: from/to, depart/arrive time, travel time, distance
+- cost calculation: km cost, stop fee, waiting fee, overtime, CO2 internal cost
+- scenario parameter audit: baseline vs current scenario differences
 
 ## 8. Ghi chú cho báo cáo
 
