@@ -1,0 +1,56 @@
+{
+  "Normal baseline": {
+    "demand_multiplier": 1.0,
+    "fuel_multiplier": 1.0,
+    "dock_a_wait_mode": 8,
+    "dock_w_wait_mode": 8,
+    "travel_triangular": [0.95, 1.05, 1.18],
+    "loading_triangular": [0.90, 1.05, 1.20],
+    "unavailable_trucks": []
+  },
+  "Mua lon / tac duong": {
+    "demand_multiplier": 1.0,
+    "fuel_multiplier": 1.0,
+    "dock_a_wait_mode": 12,
+    "dock_w_wait_mode": 12,
+    "travel_triangular": [1.05, 1.22, 1.45],
+    "loading_triangular": [0.95, 1.08, 1.25],
+    "unavailable_trucks": []
+  },
+  "Dock A nghẽn 30 phut": {
+    "demand_multiplier": 1.0,
+    "fuel_multiplier": 1.0,
+    "dock_a_wait_mode": 30,
+    "dock_w_wait_mode": 8,
+    "travel_triangular": [0.95, 1.05, 1.18],
+    "loading_triangular": [0.90, 1.05, 1.20],
+    "unavailable_trucks": []
+  },
+  "Demand +20%": {
+    "demand_multiplier": 1.2,
+    "fuel_multiplier": 1.0,
+    "dock_a_wait_mode": 10,
+    "dock_w_wait_mode": 10,
+    "travel_triangular": [0.95, 1.08, 1.22],
+    "loading_triangular": [0.95, 1.10, 1.28],
+    "unavailable_trucks": []
+  },
+  "Xe 5 tan khong kha dung": {
+    "demand_multiplier": 1.0,
+    "fuel_multiplier": 1.0,
+    "dock_a_wait_mode": 8,
+    "dock_w_wait_mode": 8,
+    "travel_triangular": [0.95, 1.05, 1.18],
+    "loading_triangular": [0.90, 1.05, 1.20],
+    "unavailable_trucks": ["Xe tải 5 tấn"]
+  },
+  "Gia nhien lieu +15%": {
+    "demand_multiplier": 1.0,
+    "fuel_multiplier": 1.15,
+    "dock_a_wait_mode": 8,
+    "dock_w_wait_mode": 8,
+    "travel_triangular": [0.95, 1.05, 1.18],
+    "loading_triangular": [0.90, 1.05, 1.20],
+    "unavailable_trucks": []
+  }
+}
